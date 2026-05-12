@@ -1,0 +1,12 @@
+[Unit]
+Description=gpuq daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/gpuq daemon --foreground
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
