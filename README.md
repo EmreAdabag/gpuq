@@ -25,7 +25,7 @@ gpuq kill <id>
 
 ## What "shared mount" means
 
-`shared_mount` in `config.yaml` must resolve to **the same absolute path** on the hub and every worker, with both sides able to read & write. Job stdout/stderr and exit-code files live there. NFS, sshfs, or any other shared filesystem works. In single-machine setups (hub == worker) any local directory works.
+`shared_mount` and `log_dir` in `config.yaml` point at a path the worker writes job stdout/stderr and the exit-code file to. If both hub and workers mount it at the same path (NFS, sshfs, etc.) the daemon reads it directly — fastest. If not, gpuq transparently falls back to SSH for reading the exit file (each tick of a finishing job) and for `gpuq logs <id>` (always SSH-tails to the worker). This means: **on a fresh worker with no admin access, you don't need to set up any shared filesystem** — gpuq will work over SSH for everything.
 
 ## State layout
 

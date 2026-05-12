@@ -85,22 +85,37 @@ def reconcile_running_jobs(cfg: Config) -> None:
             continue
         if alive:
             continue
-        exit_path = Path(job.exit_path) if job.exit_path else None
-        code: Optional[int] = None
-        if exit_path and exit_path.exists():
-            try:
-                code = int(exit_path.read_text().strip())
-            except (ValueError, OSError):
-                code = None
+        # Try local path first (real shared mount); fall back to SSH if the
+        # path isn't visible locally — supports hubs without a shared mount.
+        exists, code = _read_exit_file(job, worker)
         with state_lock():
             job.exit_code = code
-            if code is None:
+            if not exists:
                 job.status = "failed"
             else:
                 job.status = "done" if code == 0 else "failed"
             job.ended_at = now_iso()
             jobs.write_job(job)
-        log.info("Reconciled job %d -> %s (exit=%s)", job.id, job.status, code)
+        log.info(
+            "Reconciled job %d -> %s (exit=%s, file_present=%s)",
+            job.id, job.status, code, exists,
+        )
+
+
+def _read_exit_file(job: Job, worker: WorkerConfig) -> tuple[bool, Optional[int]]:
+    p = Path(job.exit_path) if job.exit_path else None
+    if p and p.exists():
+        try:
+            return True, int(p.read_text().strip())
+        except (ValueError, OSError):
+            return True, None
+    if not job.exit_path:
+        return False, None
+    try:
+        return workers.remote_cat_int(worker, job.exit_path)
+    except Exception as e:
+        log.warning("remote exit-file read failed for job %d: %s", job.id, e)
+        return False, None
 
 
 def _used_by_gpuq_on(host: str, all_jobs: list[Job]) -> set[int]:

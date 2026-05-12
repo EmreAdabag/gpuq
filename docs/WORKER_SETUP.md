@@ -12,7 +12,7 @@ This document is written so that another agent (or you) can SSH into a fresh wor
 | `tmux` on PATH | training process runs inside `tmux new-session -d` so it survives SSH disconnects |
 | `uv` on PATH for the SSH user | daemon runs `uv sync` and `uv run <cmd>` |
 | `nvidia-smi` on PATH | daemon probes GPU memory every tick to pick a free GPU |
-| Shared mount at the same absolute path as on the hub | job logs and the `.exit` file are written here so the hub can tail/read them |
+| A path matching `log_dir` in the hub's config, writeable by the worker user | the worker writes job stdout/stderr and the exit-code file there. If it's a real shared mount the hub reads them directly; otherwise gpuq SSH-tails / SSH-cats them from the worker (works transparently). |
 | Writeable `remote_repo_base` (default `~/gpuq-repos/`) | per-job repo checkouts land here via rsync |
 | User account with enough disk for repo checkouts (rsync uses `--link-dest` so they're cheap after the first) | per-job dirs are hardlink trees of the previous one |
 
@@ -59,9 +59,14 @@ You should see one row per GPU. If `nvidia-smi` errors:
 - Driver not installed: `sudo apt install nvidia-driver-XXX` (match the hub's CUDA version)
 - Driver/kernel mismatch after kernel upgrade: reboot
 
-## 4. Shared filesystem
+## 4. Shared filesystem (optional)
 
-The hub's `config.yaml` has `shared_mount: <path>` — the worker must have **the same path** writeable by the worker user. Options, in order of preference:
+The hub's `config.yaml` has `shared_mount: <path>`. **Same-path-on-both-sides is the spec's design but is not strictly required** — when the path isn't actually shared, gpuq automatically falls back to SSH for reading the job's exit file (during daemon reconcile) and tailing the log (via `gpuq logs`). This means:
+
+- The path in `shared_mount` / `log_dir` only needs to exist on the **worker** side, writeable by the worker user. The hub never needs to write or read it directly when there's no shared mount.
+- `gpuq logs <id>` runs `ssh <worker> tail …` under the hood. There's a small extra RTT per invocation, no big deal for log tailing.
+
+If you DO want a real shared mount (one less SSH round-trip per tick per running job, simpler debugging), options in order of preference:
 
 ### NFS (production)
 

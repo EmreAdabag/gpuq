@@ -107,3 +107,25 @@ def remote_mkdir_p(worker: WorkerConfig, *paths: str) -> None:
         return
     quoted = " ".join(shlex.quote(p) for p in paths)
     run_ssh(worker, f"mkdir -p {quoted}", check=True)
+
+
+def remote_cat_int(worker: WorkerConfig, path: str) -> tuple[bool, Optional[int]]:
+    """Return (file_exists, parsed_int_or_None). Used by the daemon to read the
+    job's exit file when shared_mount isn't actually shared with the hub."""
+    cmd = (
+        f"if [ -f {shlex.quote(path)} ]; then "
+        f"echo PRESENT; cat {shlex.quote(path)}; "
+        f"fi"
+    )
+    res = run_ssh(worker, cmd)
+    if res.returncode != 0:
+        return False, None
+    lines = res.stdout.splitlines()
+    if not lines or lines[0].strip() != "PRESENT":
+        return False, None
+    if len(lines) < 2:
+        return True, None
+    try:
+        return True, int(lines[1].strip())
+    except ValueError:
+        return True, None

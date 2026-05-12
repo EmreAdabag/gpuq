@@ -108,7 +108,7 @@ def logs(
     id: int = typer.Argument(...),
     follow: bool = typer.Option(False, "-f", "--follow"),
 ):
-    """Tail a job's log file."""
+    """Tail a job's log file (SSH-tailed on the worker)."""
     job = jobs_mod.try_read_job(id)
     if not job:
         console.print(f"[red]Job {id} not found.[/red]")
@@ -116,13 +116,20 @@ def logs(
     if not job.log_path:
         console.print(f"[yellow]Job {id} has no log yet (still queued?).[/yellow]")
         raise typer.Exit(0)
-    args = ["tail"]
-    if follow:
-        args += ["-n", "200", "-F"]
-    else:
-        args += ["-n", "200"]
-    args.append(job.log_path)
-    os.execvp("tail", args)
+    cfg = _load_or_die()
+    worker = cfg.worker(job.host or "")
+    if not worker:
+        console.print(f"[red]Job's host {job.host} not in config.[/red]")
+        raise typer.Exit(2)
+    follow_flag = "-F" if follow else ""
+    ssh_args = ["ssh"]
+    if worker.ssh_key:
+        ssh_args += ["-i", worker.ssh_key]
+    ssh_args += [
+        worker.ssh_target,
+        f"tail -n 200 {follow_flag} {shlex.quote(job.log_path)}",
+    ]
+    os.execvp("ssh", ssh_args)
 
 
 @app.command()

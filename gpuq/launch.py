@@ -54,8 +54,10 @@ def rsync_repo(
     cfg: Config,
     worker: WorkerConfig,
     dest_path: str,
-    log_file: Optional[Path] = None,
-) -> None:
+) -> subprocess.CompletedProcess:
+    """rsync hub's repo_root to <worker>:<dest_path>. Caller decides what to do
+    with stdout/stderr — typically: ignore on success, append to the worker-side
+    log on failure (so users see it in `gpuq logs`)."""
     with tempfile.NamedTemporaryFile("w", delete=False, suffix=".excludes") as f:
         f.write("\n".join(cfg.rsync_excludes) + "\n")
         excludes_file = f.name
@@ -75,19 +77,9 @@ def rsync_repo(
     log.debug("rsync %s -> %s:%s", src, worker.host, dest_path)
     res = subprocess.run(args, capture_output=True, text=True, timeout=600)
     Path(excludes_file).unlink(missing_ok=True)
-    if log_file:
-        try:
-            log_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(log_file, "a") as lf:
-                lf.write("=== rsync ===\n")
-                if res.stdout:
-                    lf.write(res.stdout)
-                if res.stderr:
-                    lf.write(res.stderr)
-        except OSError:
-            pass
     if res.returncode != 0:
         raise RuntimeError(f"rsync failed: {res.stderr.strip()}")
+    return res
 
 
 def update_last_synced(worker: WorkerConfig, cfg: Config, job_path: str) -> None:
@@ -179,34 +171,26 @@ def launch_job(cfg: Config, worker: WorkerConfig, job: Job) -> None:
 
     log.info("Launching job %d on %s gpus=%s", job.id, worker.host, job.gpus_assigned)
 
-    # 1. Directories. log_dir is on shared mount, but ask the worker side too.
+    # 1. Ensure remote dirs.
     try:
         workers.remote_mkdir_p(worker, repo_path, cfg.log_dir)
     except Exception as e:
-        return _fail(job, log_path, f"mkdir failed: {e}")
+        return _fail(job, worker, log_path, f"mkdir failed: {e}")
 
+    # 2. Rsync. On failure, surface stderr to the worker-side log.
     try:
-        Path(log_path).parent.mkdir(parents=True, exist_ok=True)
-        Path(log_path).touch()
-    except OSError:
-        # shared mount might not be writable from the hub (unlikely per spec, but
-        # not fatal — the worker writes the log).
-        pass
-
-    # 2. Rsync.
-    try:
-        rsync_repo(cfg, worker, repo_path, Path(log_path))
+        rsync_repo(cfg, worker, repo_path)
     except Exception as e:
-        return _fail(job, log_path, f"rsync failed: {e}")
+        return _fail(job, worker, log_path, f"rsync failed: {e}")
     update_last_synced(worker, cfg, repo_path)
 
     # 3. uv sync.
     try:
         rc = uv_sync(worker, repo_path, log_path)
     except Exception as e:
-        return _fail(job, log_path, f"uv sync errored: {e}")
+        return _fail(job, worker, log_path, f"uv sync errored: {e}")
     if rc != 0:
-        return _fail(job, log_path, f"uv sync exited {rc}")
+        return _fail(job, worker, log_path, f"uv sync exited {rc}")
 
     # 4. Secrets.
     try:
@@ -220,20 +204,27 @@ def launch_job(cfg: Config, worker: WorkerConfig, job: Job) -> None:
         push_launch_script(worker, script, repo_path)
         tmux_launch(worker, session, repo_path)
     except Exception as e:
-        return _fail(job, log_path, f"launch failed: {e}")
+        return _fail(job, worker, log_path, f"launch failed: {e}")
 
     job.status = "running"
     job.started_at = now_iso()
     write_job(job)
 
 
-def _fail(job: Job, log_path: str, message: str) -> None:
-    log.warning("Job %d: %s", job.id, message)
+def _append_remote_log(worker: WorkerConfig, log_path: str, text: str) -> None:
+    """Append text to the worker-side log file. Best-effort; swallows errors so
+    we still mark the job failed even if the worker is unreachable."""
     try:
-        with open(log_path, "a") as lf:
-            lf.write(f"\n[gpuq] {message}\n")
-    except OSError:
+        cmd = f"mkdir -p {shlex.quote(str(Path(log_path).parent))} && cat >> {shlex.quote(log_path)}"
+        args = workers.ssh_cmd(worker, cmd)
+        subprocess.run(args, input=text.encode(), capture_output=True, timeout=30)
+    except Exception:
         pass
+
+
+def _fail(job: Job, worker: WorkerConfig, log_path: str, message: str) -> None:
+    log.warning("Job %d: %s", job.id, message)
+    _append_remote_log(worker, log_path, f"\n[gpuq] {message}\n")
     job.status = "failed"
     job.ended_at = now_iso()
     write_job(job)
