@@ -97,48 +97,49 @@ def update_last_synced(worker: WorkerConfig, cfg: Config, job_path: str) -> None
 
 
 def uv_sync(worker: WorkerConfig, repo_path: str, log_path: str) -> int:
+    # `bash -lc` so ~/.profile gets sourced and uv is on PATH for non-interactive ssh.
     inner = (
         f"cd {shlex.quote(repo_path)} && "
         f"set -o pipefail && "
         f"uv sync 2>&1 | tee -a {shlex.quote(log_path)}"
     )
-    cmd = f"bash -c {shlex.quote(inner)}"
+    cmd = f"bash -lc {shlex.quote(inner)}"
     res = workers.run_ssh(worker, cmd, timeout=900)
     return res.returncode
+
+
+def _push_bytes(worker: WorkerConfig, data: bytes, remote_path: str, mode: int = 0o644) -> None:
+    """Pipe local bytes to a remote file via `ssh host 'cat > path'`.
+
+    Avoids depending on the sftp subsystem being configured on the worker (which
+    is what modern scp uses by default); only needs sshd to accept a remote shell."""
+    cmd = (
+        f"umask 077 && mkdir -p {shlex.quote(str(Path(remote_path).parent))} && "
+        f"cat > {shlex.quote(remote_path)} && "
+        f"chmod {oct(mode)[2:]} {shlex.quote(remote_path)}"
+    )
+    args = workers.ssh_cmd(worker, cmd)
+    res = subprocess.run(args, input=data, capture_output=True, timeout=60)
+    if res.returncode != 0:
+        raise RuntimeError(f"push to {worker.host}:{remote_path} failed: {res.stderr.decode(errors='replace').strip()}")
 
 
 def push_secrets(cfg: Config, worker: WorkerConfig, repo_path: str) -> None:
     if not cfg.secrets_file.exists():
         return
-    dest = f"{worker.ssh_target}:{repo_path}/.gpuq-secrets"
-    args = ["scp", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new"]
-    if worker.ssh_key:
-        args += ["-i", worker.ssh_key]
-    args += [str(cfg.secrets_file), dest]
-    res = subprocess.run(args, capture_output=True, text=True, timeout=60)
-    if res.returncode != 0:
-        raise RuntimeError(f"scp secrets failed: {res.stderr.strip()}")
-    workers.run_ssh(worker, f"chmod 600 {shlex.quote(repo_path + '/.gpuq-secrets')}")
+    _push_bytes(worker, cfg.secrets_file.read_bytes(), f"{repo_path}/.gpuq-secrets", mode=0o600)
 
 
 def push_launch_script(worker: WorkerConfig, script: str, repo_path: str) -> str:
-    with tempfile.NamedTemporaryFile("w", delete=False, suffix=".sh") as f:
-        f.write(script)
-        local_path = f.name
     remote_path = f"{repo_path}/.gpuq-launch.sh"
-    args = ["scp", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new"]
-    if worker.ssh_key:
-        args += ["-i", worker.ssh_key]
-    args += [local_path, f"{worker.ssh_target}:{remote_path}"]
-    res = subprocess.run(args, capture_output=True, text=True, timeout=60)
-    Path(local_path).unlink(missing_ok=True)
-    if res.returncode != 0:
-        raise RuntimeError(f"scp launch script failed: {res.stderr.strip()}")
+    _push_bytes(worker, script.encode(), remote_path, mode=0o755)
     return remote_path
 
 
 def tmux_launch(worker: WorkerConfig, session: str, repo_path: str) -> None:
-    inner = f"cd {shlex.quote(repo_path)} && bash .gpuq-launch.sh"
+    # `bash -l` runs the launcher as a login shell so the user's PATH (~/.profile)
+    # is picked up — otherwise `uv` and other ~/.local/bin tools aren't found.
+    inner = f"cd {shlex.quote(repo_path)} && bash -l .gpuq-launch.sh"
     cmd = f"tmux new-session -d -s {shlex.quote(session)} {shlex.quote(inner)}"
     res = workers.run_ssh(worker, cmd, check=False)
     if res.returncode != 0:

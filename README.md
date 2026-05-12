@@ -2,41 +2,86 @@
 
 A CLI for submitting PyTorch training jobs to a small pool of GPU servers over SSH.
 
-A hub machine runs `gpuq daemon`, which maintains a job queue and dispatches jobs to workers when GPUs are free. Workers need only SSH access, `tmux`, `uv`, `nvidia-smi`, and a shared network mount — no agent runs on them.
+A **hub** machine runs `gpuq daemon`, which maintains a FIFO job queue and dispatches jobs to **workers** when GPUs are free. Workers need only SSH access, `tmux`, `uv`, `nvidia-smi`, and a shared network mount — no agent runs on them.
 
-## Install
+## Quick start (single-machine: hub is also a worker)
 
-```
-uv pip install -e .
-```
-
-## Quick start
-
-```
+```bash
+uv tool install --from git+https://github.com/EmreAdabag/gpuq.git gpuq
 gpuq workers add localhost
-gpuq daemon --foreground          # or run via systemd, see packaging/
+gpuq daemon --foreground          # or run as systemd user unit, see below
+# in another shell:
 gpuq submit -- python train.py --config foo.yaml
 gpuq ps
 gpuq logs <id> -f
-gpuq attach <id>
+gpuq attach <id>                  # opens the tmux session over ssh
 gpuq kill <id>
 ```
 
-State lives under `~/.gpuq/` (override with `GPUQ_HOME`). Config is `~/.gpuq/config.yaml`; secrets go in `~/.gpuq/secrets.env` (KEY=VALUE per line, mode 600) and are sourced into the job environment before exec.
+## Full setup
 
-## systemd
+- [docs/HUB_SETUP.md](docs/HUB_SETUP.md) — preparing the hub: install, config, secrets, systemd
+- [docs/WORKER_SETUP.md](docs/WORKER_SETUP.md) — preparing a worker: SSH, uv/tmux/nvidia-smi, shared mount, onboarding
+
+## What "shared mount" means
+
+`shared_mount` in `config.yaml` must resolve to **the same absolute path** on the hub and every worker, with both sides able to read & write. Job stdout/stderr and exit-code files live there. NFS, sshfs, or any other shared filesystem works. In single-machine setups (hub == worker) any local directory works.
+
+## State layout
 
 ```
+~/.gpuq/
+  config.yaml        # workers, paths, excludes
+  secrets.env        # KEY=VALUE per line; mode 600; sourced before each job
+  daemon.pid
+  daemon.log
+  state.lock
+  next_id
+  jobs/<id>.json     # one file per job; atomic writes
+```
+
+Override the location with `GPUQ_HOME=/some/path`.
+
+## systemd (user unit)
+
+```bash
 mkdir -p ~/.config/systemd/user
 cp packaging/gpuq-daemon.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now gpuq-daemon
+loginctl enable-linger $USER       # so it survives logout
+```
+
+## CLI
+
+```
+gpuq submit [--name NAME] [--host HOST] [--gpus N] -- <command...>
+gpuq ps [--all]
+gpuq logs <id> [-f]
+gpuq attach <id>
+gpuq kill <id>
+gpuq workers                       # = workers list
+gpuq workers add <host>
+gpuq workers refresh
+gpuq sync <host>                   # warm: rsync + uv sync, don't launch
+gpuq daemon [--foreground] [-v]
 ```
 
 ## Tests
 
-```
+```bash
 uv pip install -e '.[dev]'
-pytest                          # unit tests
-GPUQ_INTEGRATION=1 pytest       # adds the localhost end-to-end test
+pytest                              # 22 unit tests
+GPUQ_INTEGRATION=1 pytest           # adds the localhost end-to-end test
 ```
+
+## Design notes
+
+- Two components, both on the hub: the CLI and the daemon. Workers run nothing.
+- All state on disk under `~/.gpuq/`. One JSON file per job, atomic writes. No SQLite.
+- Daemon is single-threaded, polls workers every ~2s with `nvidia-smi`.
+- Each job runs in its own `tmux` session named `gpuq-<id>` on the worker, in a per-job repo checkout under `~/gpuq-repos/job-<id>/` (rsync'd with `--link-dest` so it's hardlink-cheap).
+- `CUDA_VISIBLE_DEVICES` is set in the launcher script to the GPU indices the daemon picked; from inside the training process, GPUs are seen as `0..N-1`.
+- A GPU is considered "free for gpuq" if it's in the worker's `gpus:` allowlist, isn't already assigned to a running gpuq job, and has `used_memory_mb < gpu_free_memory_threshold_mb`. The threshold keeps gpuq off GPUs humans are using.
+- Kills of running jobs go via a `<id>.kill` flag file; the daemon picks it up on the next tick and `tmux kill-session`s.
+- Daemon restart is safe — on startup it reconciles every `running` job by checking the remote tmux session and the exit file.
