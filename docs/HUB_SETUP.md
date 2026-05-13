@@ -76,9 +76,25 @@ gpu_free_memory_threshold_mb: 500
 ```
 
 Critical fields:
-- **`repo_root`** must point at a uv-managed project (i.e. it has a `pyproject.toml`); the daemon runs `uv sync` on the remote copy before launching.
-- **`shared_mount`** must be the *same absolute path* on the hub and every worker, and writeable by all of them. On single-machine setups, any local directory works.
+- **`repo_root`** must point at a uv-managed project (`pyproject.toml`), OR a regular Python repo that you want rsync'd to the workers (paired with `env_setup` on each worker — see below).
+- **`shared_mount`** is the path the worker writes job logs/exit files to. If hub and workers actually share that path (NFS/sshfs), the daemon hits a local fast path; otherwise it transparently SSH-tails/SSH-cats. No real shared filesystem is required for gpuq to work.
 - **`gpus`** is gpuq's allowlist for that host — gpuq will not touch any GPU outside it, leaving humans free to use the rest.
+
+### Using a pre-existing env (conda, system venv, anything not uv)
+
+If your training repo isn't uv-managed (e.g. you use a conda env), set `env_setup` per-worker. When set, gpuq skips `uv sync` and runs your command in that activated env directly, with no `uv run` wrapper:
+
+```yaml
+workers:
+  - host: iotwo.example.com
+    user: me
+    gpus: [0, 1, 2]
+    env_setup: |
+      source ~/miniconda3/etc/profile.d/conda.sh
+      conda activate robomimic_venv
+```
+
+You're then responsible for keeping that env up to date on the worker (gpuq doesn't try to manage conda envs). Job command: just `python train.py …` — exactly what you'd type locally inside the env.
 
 ## 5. Fill in secrets
 

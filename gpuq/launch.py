@@ -15,7 +15,7 @@ from .jobs import Job, now_iso, write_job
 log = logging.getLogger(__name__)
 
 
-LAUNCH_SCRIPT_TEMPLATE = """#!/usr/bin/env bash
+_LAUNCH_HEADER = """#!/usr/bin/env bash
 set -a
 [ -f .gpuq-secrets ] && source .gpuq-secrets
 set +a
@@ -23,24 +23,49 @@ export CUDA_VISIBLE_DEVICES={cuda_devices}
 export GPUQ_JOB_ID={job_id}
 export GPUQ_HOST={host}
 cd {repo_path}
-{{
+"""
+
+_LAUNCH_BODY_UV = """{{
   uv run {command}
 }} > >(tee -a {log_path}) 2> >(tee -a {log_path} >&2)
 echo $? > {exit_path}
 """
 
+# When env_setup is set, we don't wrap in `uv run` — the user's command runs
+# in the activated environment exactly as they'd run it locally.
+_LAUNCH_BODY_ENV = """{{
+{env_setup}
+  {command}
+}} > >(tee -a {log_path}) 2> >(tee -a {log_path} >&2)
+echo $? > {exit_path}
+"""
 
-def build_launch_script(job: Job, host: str) -> str:
+
+def build_launch_script(job: Job, worker: "WorkerConfig") -> str:
     cuda = ",".join(str(g) for g in job.gpus_assigned)
-    return LAUNCH_SCRIPT_TEMPLATE.format(
+    header = _LAUNCH_HEADER.format(
         cuda_devices=shlex.quote(cuda),
         job_id=job.id,
-        host=shlex.quote(host),
+        host=shlex.quote(worker.host),
         repo_path=shlex.quote(job.remote_repo_path or ""),
-        command=job.command,
-        log_path=shlex.quote(job.log_path or ""),
-        exit_path=shlex.quote(job.exit_path or ""),
     )
+    if worker.env_setup:
+        # Indent the user's env_setup snippet so it sits cleanly inside the { ... }
+        # group and any errors are still captured by the tee redirection.
+        env_block = "\n".join("  " + line for line in worker.env_setup.strip().splitlines())
+        body = _LAUNCH_BODY_ENV.format(
+            env_setup=env_block,
+            command=job.command,
+            log_path=shlex.quote(job.log_path or ""),
+            exit_path=shlex.quote(job.exit_path or ""),
+        )
+    else:
+        body = _LAUNCH_BODY_UV.format(
+            command=job.command,
+            log_path=shlex.quote(job.log_path or ""),
+            exit_path=shlex.quote(job.exit_path or ""),
+        )
+    return header + body
 
 
 def _ssh_e_flag(worker: WorkerConfig) -> str:
@@ -184,13 +209,15 @@ def launch_job(cfg: Config, worker: WorkerConfig, job: Job) -> None:
         return _fail(job, worker, log_path, f"rsync failed: {e}")
     update_last_synced(worker, cfg, repo_path)
 
-    # 3. uv sync.
-    try:
-        rc = uv_sync(worker, repo_path, log_path)
-    except Exception as e:
-        return _fail(job, worker, log_path, f"uv sync errored: {e}")
-    if rc != 0:
-        return _fail(job, worker, log_path, f"uv sync exited {rc}")
+    # 3. Env sync. With env_setup configured (e.g. conda), the user is
+    # responsible for keeping the env up to date on the worker.
+    if worker.uses_uv:
+        try:
+            rc = uv_sync(worker, repo_path, log_path)
+        except Exception as e:
+            return _fail(job, worker, log_path, f"uv sync errored: {e}")
+        if rc != 0:
+            return _fail(job, worker, log_path, f"uv sync exited {rc}")
 
     # 4. Secrets.
     try:
@@ -199,7 +226,7 @@ def launch_job(cfg: Config, worker: WorkerConfig, job: Job) -> None:
         log.warning("push_secrets failed for job %d: %s", job.id, e)
 
     # 5. Push launcher + tmux.
-    script = build_launch_script(job, worker.host)
+    script = build_launch_script(job, worker)
     try:
         push_launch_script(worker, script, repo_path)
         tmux_launch(worker, session, repo_path)

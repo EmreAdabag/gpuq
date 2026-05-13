@@ -16,10 +16,20 @@ class WorkerConfig:
     user: str
     gpus: list[int]
     ssh_key: Optional[str] = None
+    # Optional: shell snippet to run before the user's command, e.g.
+    #   "source ~/miniconda3/etc/profile.d/conda.sh && conda activate myenv"
+    # When set, gpuq skips `uv sync` on launch and runs the user command
+    # without the `uv run` prefix — handy for conda envs or any pre-existing
+    # interpreter that doesn't fit the uv workflow.
+    env_setup: Optional[str] = None
 
     @property
     def ssh_target(self) -> str:
         return f"{self.user}@{self.host}"
+
+    @property
+    def uses_uv(self) -> bool:
+        return self.env_setup is None
 
 
 @dataclass
@@ -58,6 +68,7 @@ def load_config(path: Optional[Path] = None) -> Config:
                 user=w["user"],
                 gpus=[int(x) for x in (w.get("gpus") or [])],
                 ssh_key=_expand(w["ssh_key"]) if w.get("ssh_key") else None,
+                env_setup=w.get("env_setup"),
             )
         )
     return Config(

@@ -52,6 +52,22 @@ systemctl --user enable --now gpuq-daemon
 loginctl enable-linger $USER       # so it survives logout
 ```
 
+## Using a conda env (or any non-uv env)
+
+Set `env_setup` per-worker in `config.yaml`. When present, gpuq skips `uv sync` and runs your command inside the activated env directly (no `uv run` wrapper):
+
+```yaml
+workers:
+  - host: gpu1.lan
+    user: me
+    gpus: [0, 1]
+    env_setup: |
+      source ~/miniconda3/etc/profile.d/conda.sh
+      conda activate myenv
+```
+
+Your env is your responsibility to keep up to date on each worker; gpuq doesn't manage conda envs.
+
 ## CLI
 
 ```
