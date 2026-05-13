@@ -59,7 +59,30 @@ You should see one row per GPU. If `nvidia-smi` errors:
 - Driver not installed: `sudo apt install nvidia-driver-XXX` (match the hub's CUDA version)
 - Driver/kernel mismatch after kernel upgrade: reboot
 
-## 4. Shared filesystem (optional)
+## 4. Shared filesystem (optional, but if you want it: use the script)
+
+For everything beyond a single-machine setup, the easiest way to share data, code, or outputs between hub and worker is the canned setup script in `tools/setup-worker-mount.sh`. It wraps the whole sshfs+systemd dance and **defaults to read-only**, which is the safe choice for inputs (datasets, code) — accidental `rm`s on the worker side fail with `EROFS` instead of propagating back to the hub.
+
+```bash
+# Read-only: code + dataset dir (safe; worker can't damage it).
+./tools/setup-worker-mount.sh <worker> /home/me/code/my-training-repo
+
+# Read-write: output dir only. Mount the narrowest path that needs writes.
+./tools/setup-worker-mount.sh <worker> /home/me/code/my-training-repo/checkpoints --rw
+```
+
+The script is idempotent and:
+1. authorizes the worker's pubkey on the hub (generates one if needed),
+2. checks that the hub's sshd exposes the sftp subsystem (prints a fix if not),
+3. installs sshfs on the worker (`sudo apt-get install -y sshfs`),
+4. enables systemd user linger on the worker so mounts survive reboot (best-effort),
+5. writes and enables a `systemd --user` unit for the mount.
+
+**Always think about the mode.** A read-write sshfs mount is a bidirectional channel: a `rm -rf` on the worker side will propagate deletions back to the hub. Prefer read-only for inputs; mount the narrowest possible RW path for outputs; keep backups regardless.
+
+To take a mount down: `ssh <worker> systemctl --user disable --now sshfs-<slug>.service`.
+
+If you'd rather not script it (e.g. you have a real shared filesystem you want to use instead):
 
 The hub's `config.yaml` has `shared_mount: <path>`. **Same-path-on-both-sides is the spec's design but is not strictly required** — when the path isn't actually shared, gpuq automatically falls back to SSH for reading the job's exit file (during daemon reconcile) and tailing the log (via `gpuq logs`). This means:
 
